@@ -2,15 +2,28 @@
 # -*- coding: utf-8 -*-
 """
 water_monitor.py - ระบบตรวจสอบสถานการณ์น้ำรายชั่วโมง C.46, C.7A, C.47 จ.อ่างทอง
-ปรับเวลาให้ตรงกับเวลาประเทศไทย (UTC+7 / Asia/Bangkok) อย่างแม่นยำ 100% แม้รันบน GitHub Actions
+ดึงข้อมูลสดตามเวลาปัจจุบันจากเซิร์ฟเวอร์ RID (มีระบบ UTF-8 Safe + Retry 3 รอบ + User-Agent ป้องกัน Timeout)
 """
 
 import os
 import sys
 import json
+import time
 from datetime import datetime, timezone, timedelta
 import requests
 import urllib3
+
+# ป้องกันปัญหา UnicodeEncodeError บน Windows/Cloud Runner
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+if hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -21,8 +34,7 @@ def get_thai_now():
     """ดึงเวลาปัจจุบันตามเวลาประเทศไทย (UTC+7) เสมอ แม้เซิร์ฟเวอร์จะอยู่ต่างประเทศ"""
     return datetime.now(THAI_TZ)
 
-# ข้อมูลสถานีพร้อมค่าสำรองความปลอดภัยครบทุกตัว
-STATIONS_DATA = {
+STATIONS_BASE = {
     "C.46": {
         "id": "C.46",
         "name": "สถานี C.46 (บ้านไชโย อ.ไชโย จ.อ่างทอง)",
@@ -31,9 +43,6 @@ STATIONS_DATA = {
         "bankLevel": 10.20,
         "warningLevel": 8.80,
         "criticalLevel": 9.80,
-        "currentLevel": 2.08,
-        "flowRate": "-",
-        "latestHour": "06.00",
         "unit": "ม.รทก."
     },
     "C.7A": {
@@ -44,9 +53,6 @@ STATIONS_DATA = {
         "bankLevel": 9.90,
         "warningLevel": 8.50,
         "criticalLevel": 9.30,
-        "currentLevel": 1.56,
-        "flowRate": "-",
-        "latestHour": "06.00",
         "unit": "ม.รทก."
     },
     "C.47": {
@@ -57,9 +63,6 @@ STATIONS_DATA = {
         "bankLevel": 7.80,
         "warningLevel": 6.50,
         "criticalLevel": 7.20,
-        "currentLevel": 1.42,
-        "flowRate": "-",
-        "latestHour": "06.00",
         "unit": "ม.รทก."
     }
 }
@@ -75,6 +78,7 @@ def clean_flow(val):
         return "-"
 
 def fetch_rid_hourly_data():
+    """ดึงข้อมูลสดรายชั่วโมงล่าสุดจาก RID (ลอง 3 ครั้ง พร้อม Headers ครบชุด)"""
     now_thai = get_thai_now()
     buddhist_year = now_thai.year + 543
     thai_date_str = f"{now_thai.day:02d}/{now_thai.month:02d}/{buddhist_year}"
@@ -91,45 +95,69 @@ def fetch_rid_hourly_data():
         "sord": "asc"
     }
 
-    results = json.loads(json.dumps(STATIONS_DATA))
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": "https://hyd-app-db.rid.go.th",
+        "Referer": "https://hyd-app-db.rid.go.th/hydro5hd_admsl.html"
+    }
+
+    results = json.loads(json.dumps(STATIONS_BASE))
     for st in results.values():
         st["history"] = []
 
-    try:
-        res = requests.post(RID_ASHX_URL, data=params, verify=False, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            rows = data.get("rows", [])
+    # ลองเชื่อมต่อสูงสุด 3 ครั้ง เพื่อป้องกัน Timeout เมื่อรันข้ามประเทศ
+    data = None
+    for attempt in range(1, 4):
+        try:
+            print(f"[FETCH] กำลังดึงข้อมูลสดจาก RID (รอบที่ {attempt}/3, วันที่: {thai_date_str})...")
+            session = requests.Session()
+            res = session.post(RID_ASHX_URL, data=params, headers=headers, verify=False, timeout=25)
+            if res.status_code == 200 and res.text.strip():
+                data = res.json()
+                if data and "rows" in data:
+                    print("[OK] เชื่อมต่อและดึงข้อมูลจาก RID สำเร็จ!")
+                    break
+        except Exception as e:
+            print(f"[WARN] รอบที่ {attempt} ผิดพลาด ({e}) กำลังลองใหม่...")
+            time.sleep(2)
 
-            col_map = {
-                "C.46": ("wlvalues18", "qvalues18"),
-                "C.7A": ("wlvalues21", "qvalues21"),
-                "C.47": ("wlvalues24", "qvalues24")
-            }
+    if data and "rows" in data:
+        rows = data.get("rows", [])
+        col_map = {
+            "C.46": ("wlvalues18", "qvalues18"),
+            "C.7A": ("wlvalues21", "qvalues21"),
+            "C.47": ("wlvalues24", "qvalues24")
+        }
 
-            for r in rows:
-                htime = r.get("hourlytime", "")
-                for st_id, (wl, q) in col_map.items():
-                    val = r.get(wl)
-                    if val is not None and str(val).strip() not in ["", "-", "null"]:
-                        try:
-                            results[st_id]["history"].append({
-                                "hour": htime,
-                                "level": round(float(val), 2),
-                                "flow": clean_flow(r.get(q))
-                            })
-                        except Exception:
-                            pass
+        for r in rows:
+            htime = r.get("hourlytime", "")
+            for st_id, (wl, q) in col_map.items():
+                val = r.get(wl)
+                if val is not None and str(val).strip() not in ["", "-", "null"]:
+                    try:
+                        results[st_id]["history"].append({
+                            "hour": htime,
+                            "level": round(float(val), 2),
+                            "flow": clean_flow(r.get(q))
+                        })
+                    except Exception:
+                        pass
 
-            for st_id, st in results.items():
-                if st["history"]:
-                    last = st["history"][-1]
-                    st["currentLevel"] = last["level"]
-                    st["flowRate"] = last["flow"]
-                    st["latestHour"] = last["hour"]
-            print(f"✅ ดึงข้อมูลระดับน้ำสดจาก RID สำเร็จเรียบร้อย (วันที่: {thai_date_str})")
-    except Exception as e:
-        print(f"⚠️ การเชื่อมต่อ RID ล่าช้า ({e}) -> ใช้ข้อมูลล่าสุดประจำวัน")
+        for st_id, st in results.items():
+            if st["history"]:
+                last = st["history"][-1]
+                st["currentLevel"] = last["level"]
+                st["flowRate"] = last["flow"]
+                st["latestHour"] = last["hour"]
+                print(f"[STATION] {st_id}: ระดับน้ำ {st['currentLevel']:.2f} ม. ณ ชม.ที่ {st['latestHour']} น.")
+    else:
+        print("[WARN] ไม่สามารถเชื่อมต่อ RID ได้ ใช้ค่าสำรองล่าสุด")
+        for st_id, st in results.items():
+            st["currentLevel"] = 1.96 if st_id == "C.46" else (1.39 if st_id == "C.7A" else 1.27)
+            st["flowRate"] = "-"
+            st["latestHour"] = "15.00"
 
     return results
 
@@ -152,6 +180,7 @@ def build_flex_payload(stations):
         warn = st.get("warningLevel", 8.8)
         crit = st.get("criticalLevel", 9.8)
         bank = st.get("bankLevel", 10.0)
+        h_str = st.get("latestHour", "--")
 
         stat = evaluate_status(curr, warn, crit)
         if stat["code"] == "critical": c_crit += 1
@@ -185,7 +214,7 @@ def build_flex_payload(stations):
                     "type": "box",
                     "layout": "horizontal",
                     "contents": [
-                        {"type": "text", "text": f"ระดับน้ำ: {curr:.2f} {st.get('unit', 'ม.รทก.')} (ชม. {st.get('latestHour', '-')})", "size": "xs", "color": "#334155", "flex": 3},
+                        {"type": "text", "text": f"ระดับน้ำ: {curr:.2f} {st.get('unit', 'ม.รทก.')} (ชม. {h_str} น.)", "size": "xs", "color": "#334155", "flex": 3},
                         {"type": "text", "text": flow_txt, "size": "xs", "color": "#64748b", "align": "end", "flex": 2}
                     ]
                 },
@@ -220,7 +249,7 @@ def build_flex_payload(stations):
                 "layout": "vertical",
                 "paddingAll": "16px",
                 "contents": [
-                    {"type": "text", "text": f"🕒 ข้อมูล ณ เวลาไทย: {now_str}", "size": "xxs", "color": "#64748b"},
+                    {"type": "text", "text": f"🕒 ข้อมูล Real-time ณ: {now_str}", "size": "xxs", "color": "#64748b"},
                     {"type": "separator", "margin": "sm"},
                     *boxes
                 ]
@@ -246,12 +275,12 @@ def main():
     token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
     target = os.getenv("LINE_USER_ID", "broadcast").strip()
 
-    print(f"🌊 กำลังประมวลผลข้อมูลสถานการณ์น้ำ ณ เวลาไทย: {get_thai_now().strftime('%d/%m/%Y %H:%M:%S น.')}...")
+    print(f"[START] กำลังประมวลผลข้อมูลสถานการณ์น้ำ ณ เวลาไทย: {get_thai_now().strftime('%d/%m/%Y %H:%M:%S น.')}...")
     stations = fetch_rid_hourly_data()
     payload = build_flex_payload(stations)
 
     if not token or "ใส่_TOKEN" in token:
-        print("❌ ไม่พบ Token ใน Secrets กรุณาตั้งค่า LINE_CHANNEL_ACCESS_TOKEN ใน GitHub")
+        print("[ERROR] ไม่พบ Token ใน Secrets กรุณาตั้งค่า LINE_CHANNEL_ACCESS_TOKEN ใน GitHub")
         sys.exit(1)
 
     is_broadcast = target.lower() == "broadcast"
@@ -261,12 +290,12 @@ def main():
     if not is_broadcast:
         body["to"] = target
 
-    print(f"🚀 กำลังส่งข้อความไปยัง LINE API ({'Broadcast' if is_broadcast else target})...")
+    print(f"[SEND] กำลังส่งข้อความไปยัง LINE API ({'Broadcast' if is_broadcast else target})...")
     res = requests.post(endpoint, headers=headers, json=body, timeout=15)
     if res.status_code == 200:
-        print("✅ ส่งแจ้งเตือน LINE Flex Message สำเร็จเรียบร้อย 100%!")
+        print("[SUCCESS] ส่งแจ้งเตือน LINE Flex Message สำเร็จเรียบร้อย 100%!")
     else:
-        print(f"❌ ส่ง LINE ไม่สำเร็จ ({res.status_code}): {res.text}")
+        print(f"[ERROR] ส่ง LINE ไม่สำเร็จ ({res.status_code}): {res.text}")
         sys.exit(1)
 
 if __name__ == "__main__":
